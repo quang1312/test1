@@ -1,0 +1,211 @@
+Claude
+/
+Tôi kiểm tra timer của viewmodel và xem các tab khác đang cài LRU cache thế nào để làm giống.
+
+Cache và polling đã chạy đúng. Đây là các chỗ cần sửa, gồm 3 file.
+
+1. backend/services/influx/query_cache.py
+Thêm method này vào class BackgroundQueryCache, ngay trước def _remember:
+
+python
+    def invalidate(self, key: Any) -> None:
+        """Bỏ 1 key khỏi cache (vd người dùng bấm Refresh thủ công) để lần get kế tiếp lấy dữ liệu mới."""
+        with self._lock:
+            self._cache.pop(key, None)
+2. backend/services/analytics/live_dataset_builder.py
+build() giờ có thể chạy đồng thời trên nhiều thread (cache refresh nền) nên không được giữ state trong self.
+
+a) Xóa dòng self._crosses_midnight = False trong __init__.
+
+b) Đổi phần đầu build():
+
+python
+    def build(self, analytics_filter: AnalyticsFilter, grid_id: int | None = None) -> dict:
+        # build() có thể chạy đồng thời trên nhiều thread (cache refresh nền) -> không giữ state trong self
+        topology = self._topology_vm.topology_model if self._topology_vm is not None else None
+        if grid_id is None:
+            grid_id = self._topology_vm.selectedGridId if self._topology_vm is not None else 0
+c) Trong build(), thay 2 dòng self._crosses_midnight = ... và samples = [...] bằng:
+
+python
+        crosses_midnight = bool(rows) and rows[0]["dt"].date() != rows[-1]["dt"].date()
+        samples = [self._sample(i, row, soc_by_index.get(i), bucket, crosses_midnight) for i, row in enumerate(rows)]
+d) Đổi chữ ký và điều kiện trong _sample():
+
+python
+    def _sample(self, index: int, row: dict, soc, bucket: str, crosses_midnight: bool) -> dict:
+        ...
+        if bucket == "hour" and crosses_midnight:
+3. backend/viewmodels/analytics_viewmodel.py
+a) Thêm import:
+
+python
+import time
+...
+from backend.services.influx.query_cache import BackgroundQueryCache
+(timedelta cũng cần: from datetime import datetime, timedelta.)
+
+b) Thay khối hằng số (_LIVE_POLL_MS ... _RETRY_DELAY_MS) bằng:
+
+python
+_LIVE_POLL_MS = 15000        # poll nhẹ: cache trả ngay, refresh nền; rollup Influx cũng chỉ cập nhật ~30s
+_SIM_POLL_MS = 5000
+_CACHE_MAX_ENTRIES = 64      # LRU, giống các tab khác (forecast...)
+_CACHE_BUCKET_SECONDS = 300  # key đổi mỗi 5 phút -> tránh hiện số cũ quá lâu sau khi bỏ tab một thời gian
+_PENDING_ATTEMPTS = 6        # historian/MySQL trả rỗng ở lần gọi đầu (đang nạp nền) -> đợi trong thread nền
+_PENDING_DELAY_S = 0.5
+_LIVE_RANGES = {"Realtime", "Today", "Last 7 days", "This month"}   # các range còn chứa "bây giờ"
+c) Trong __init__: thay self._retries = 0 bằng:
+
+python
+        self._cache = BackgroundQueryCache(max_entries=_CACHE_MAX_ENTRIES, name="analytics")
+        self._last_payload = None
+Hai dòng connect của topology đổi self.refreshAnalytics thành self._refresh:
+
+python
+                topology_vm.selectedGridChanged.connect(self._refresh)
+                ...
+                topology_vm.configChanged.connect(self._refresh)
+Timer và dòng cuối __init__:
+
+python
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
+        self._refresh()
+d) Thay toàn bộ từ def refreshAnalytics đến hết def _apply_result (trước def _refresh_simulator) bằng:
+
+python
+    @Slot()
+    def refreshAnalytics(self):
+        """Nút Refresh thủ công: bỏ cache của key hiện tại, lấy dữ liệu mới."""
+        self._refresh(force=True)
+
+    def _cache_key(self, analytics_filter: AnalyticsFilter, grid_id: int) -> tuple:
+        # assetType KHÔNG nằm trong key: dữ liệu không đổi theo asset, chỉ KPI/khuyến nghị lọc lại
+        bucket = int(time.time() // _CACHE_BUCKET_SECONDS)
+        return (grid_id, analytics_filter.timeRange, analytics_filter.fromTime, analytics_filter.toTime, bucket)
+
+    def _refresh(self, background: bool = False, force: bool = False):
+        if not self._filter.valid:
+            self._set_error(self._filter.message)
+            return
+        if self._builder is None:
+            self._refresh_simulator()
+            return
+        if not background:
+            self._set_loading(True)   # poll nền không bật "UPDATING" để khỏi nhấp nháy
+        self._generation += 1
+        grid_id = self._topology_vm.selectedGridId
+        job = (self._generation, copy.deepcopy(self._filter), grid_id, force)
+        with self._job_lock:
+            if self._busy:
+                self._pending_job = job   # chỉ giữ job mới nhất
+                return
+            self._busy = True
+        self._start_job(job)
+
+    def _start_job(self, job):
+        threading.Thread(target=self._run_job, args=job, daemon=True, name="analytics-live").start()
+
+    def _compute(self, analytics_filter: AnalyticsFilter, grid_id: int) -> dict:
+        """Chạy trên thread nền (cả lần miss lẫn refresh nền của cache) -> dùng calculator riêng, không chia sẻ state."""
+        dataset = None
+        for _ in range(_PENDING_ATTEMPTS):
+            dataset = self._builder.build(analytics_filter, grid_id)
+            if not dataset.get("pending"):
+                break
+            time.sleep(_PENDING_DELAY_S)
+        calculated = AnalyticsCalculator().calculate(dataset)
+        return {"calculated": calculated, "has_data": bool(dataset["samples"]), "stamp": time.time()}
+
+    def _run_job(self, generation: int, analytics_filter: AnalyticsFilter, grid_id: int, force: bool):
+        key = self._cache_key(analytics_filter, grid_id)
+        try:
+            if force:
+                self._cache.invalidate(key)
+            payload = self._cache.get(key, lambda: self._compute(analytics_filter, grid_id), None)
+            if payload is None:
+                payload = {"error": "Analytics refresh failed (see log)"}
+        except Exception as exc:
+            logger.exception("Analytics live build failed")
+            payload = {"error": f"Analytics refresh failed: {exc}"}
+        with self._job_lock:
+            nxt, self._pending_job = self._pending_job, None
+            if nxt is None:
+                self._busy = False
+        self._buildReady.emit(generation, payload)
+        if nxt is not None:
+            self._start_job(nxt)
+
+    def _apply_result(self, generation: int, payload: dict):
+        if generation != self._generation:
+            return  # kết quả cũ: đã có yêu cầu mới hơn
+        self._set_loading(False)
+        if "error" in payload:
+            self._set_error(payload["error"])
+            return
+        self._set_error("" if payload["has_data"] else "No historian data for the selected range (Influx power_rollup / rollup_daemon)")
+        previous, self._last_payload = self._last_payload, payload
+        if previous is not None and (previous is payload or previous["calculated"] == payload["calculated"]):
+            return  # chưa có số liệu mới -> không publish lại, tránh QML vẽ lại toàn bộ chart
+        self._publish(payload["calculated"], payload["has_data"])
+e) Mọi chỗ nội bộ còn gọi self.refreshAnalytics() (trong setTimeRange, setAssetFilter/_refresh_filtered_views, ...) đổi thành self._refresh(). Chỉ nút Refresh trên QML mới gọi refreshAnalytics (ép bỏ cache).
+
+f) Thay _refresh_realtime bằng:
+
+python
+    def _range_includes_now(self) -> bool:
+        name = self._filter.timeRange
+        if name in _LIVE_RANGES:
+            return True
+        if name == "Custom range":
+            try:
+                return datetime.fromisoformat(self._filter.toTime) >= datetime.now() - timedelta(hours=2)
+            except ValueError:
+                return False
+        return False   # Yesterday / Last month: dữ liệu đã đóng, không cần poll
+
+    def _poll(self):
+        if self._builder is None:
+            if self._filter.timeRange == "Realtime":   # simulator: giữ hành vi cũ
+                self._refresh()
+            return
+        if self._range_includes_now():
+            self._refresh(background=True)
+Cách hoạt động
+Lỗi gốc: timer cũ chỉ refresh khi range là Realtime. Giờ mọi range còn chứa “bây giờ” (Today, Last 7 days, This month, Custom có to gần hiện tại) đều tự poll mỗi 15 giây. Yesterday và Last month đã đóng nên không poll.
+Cache: dùng BackgroundQueryCache(max_entries=64) như tab Forecast. Key gồm grid, range, from, to và mốc 5 phút; không gồm asset. Đổi range rồi quay lại, hoặc đổi asset, thì hiện ngay, không query lại.
+Mốc 5 phút: key đổi theo mốc này để khi bỏ tab lâu rồi quay lại không thấy số cũ.
+Cơ chế hit/miss: cache hit trả ngay kết quả cũ và refresh nền cho vòng sau, nên số trên màn hình trễ tối đa một vòng poll (15 giây). Cache miss mới phải chờ, và việc chờ nằm ở thread nền nên UI không đứng.
+Poll nền: không bật “UPDATING” và chỉ publish khi số liệu thực sự đổi, nên chart không bị vẽ lại vô ích.
+Retry: đợi historian nạp lần đầu giờ nằm trong thread nền (_compute), nên bỏ cơ chế retry bằng QTimer cũ.
+Nút Refresh: nút REFRESH vẫn ép lấy dữ liệu mới bằng cách gọi invalidate(key) rồi mới get.
+Tôi chạy thử bằng historian giả lập:
+
+Today tự refresh và chỉ publish một lần khi số liệu không đổi.
+Yesterday không poll.
+Đổi asset không gây build lại.
+Cache dừng ở 64 mục khi chèn 70.
+Nút Refresh build lại đúng 1 lần.
+Chưa thử trên Influx/MySQL thật.
+
+cái recommendation/ insight ấy, nội dung dài nên bị mất chữ, đổi sang xuống dòng cho tôi
+
+Đã chạy một lệnh
+Nguyên nhân: card có chiều cao cố định 112px và mọi dòng chữ đều bật elide. Tôi đổi sang tự xuống dòng và để chiều cao card tự giãn theo nội dung.
+
+Đã chạy một lệnh
+Đã tạm dừng: Hạn mức sử dụng miễn phí của bạn sẽ được khôi phục lúc 16:30. Hãy tiếp tục vào lúc đó.
+
+Bạn đã hết tin nhắn miễn phí cho đến 16:30
+
+
+Claude là AI và có thể mắc lỗi. Vui lòng kiểm tra kỹ các câu trả lời.
+
+
+
+
+
+
+
+Claude đã trả lời xong
